@@ -1,0 +1,15 @@
+title: CyberTrace Suspicious PowerShell Keyword Triage
+id: 8bb55d30-a4e1-4d15-9a1a-20a5d57c4c01
+status: experimental
+description: Starter keyword rule. Use a full Sigma backend for production evaluation.
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection:
+    CommandLine:
+      - powershell
+      - Invoke-Expression
+      - DownloadString
+  condition: selection
+level: medium

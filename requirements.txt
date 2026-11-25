@@ -1,0 +1,12 @@
+Flask>=3.0,<4
+gunicorn>=22
+cryptography>=42
+volatility3>=2.7
+scapy>=2.5
+python-evtx>=0.7
+PyYAML>=6
+requests>=2.31
+stix2>=3
+taxii2-client>=2.3
+neo4j>=5.20
+reportlab>=4

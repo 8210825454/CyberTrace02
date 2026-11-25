@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: cybertrace-imp03
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: MAX_UPLOAD_MB
+        value: 50
+      - key: OTX_API_KEY
+        sync: false
+      - key: CYBERTRACE_SECRET_KEY
+        generateValue: true

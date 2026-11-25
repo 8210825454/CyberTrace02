@@ -1,0 +1,16 @@
+__pycache__/
+.venv/
+venv/
+.env
+*.pem
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.pcap
+*.pcapng
+*.mem
+*.dmp
+*.raw
+*.lime
+*.evtx
