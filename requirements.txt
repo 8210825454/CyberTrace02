@@ -10,3 +10,4 @@ stix2>=3
 taxii2-client>=2.3
 neo4j>=5.20
 reportlab>=4
+Flask-Login==0.6.3
