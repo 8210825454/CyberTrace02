@@ -1,8 +1,12 @@
-import os, re, json, csv, io, uuid, hashlib, sqlite3, zipfile, shutil, subprocess, ipaddress
+import os, re, json, csv, io, uuid, hashlib, sqlite3, zipfile, shutil, subprocess, smtplib, secrets
 from pathlib import Path
-from datetime import datetime, timezone
-from flask import Flask, request, jsonify, render_template, send_file, abort
+from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from flask import Flask, request, jsonify, render_template, render_template_string, send_file, abort, redirect, url_for, flash
 from werkzeug.utils import secure_filename
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidSignature
@@ -18,22 +22,116 @@ for folder in (DATA, EVIDENCE, REPORTS, PACKAGES):
 DB = DATA / "cybertrace.db"
 ALLOWED = {".raw", ".mem", ".dmp", ".lime", ".pcap", ".pcapng", ".evtx", ".log", ".txt"}
 app = Flask(__name__)
+
 app.secret_key = os.getenv("CYBERTRACE_SECRET_KEY", "local-development-only-change-me")
+if os.getenv("RENDER") == "true" and app.secret_key == "local-development-only-change-me":
+    raise RuntimeError("Set a strong CYBERTRACE_SECRET_KEY in Render environment.")
+
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("RENDER") == "true"
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
+login_manager.login_message = "Please log in to access CyberTrace."
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "512")) * 1024 * 1024
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
+
 def db():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
-    c.execute("""CREATE TABLE IF NOT EXISTS evidence(
-        id TEXT PRIMARY KEY, filename TEXT, path TEXT, sha256 TEXT, created TEXT, size INTEGER)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS custody(
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, evidence_id TEXT, event TEXT, timestamp TEXT,
-        prev_hash TEXT, record_hash TEXT, signature TEXT, details TEXT)""")
+
+    # User accounts
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            username TEXT UNIQUE,
+            password_hash TEXT NOT NULL,
+            created TEXT NOT NULL
+        )
+    """)
+
+    user_columns = [row["name"] for row in c.execute("PRAGMA table_info(users)").fetchall()]
+    if "username" not in user_columns:
+        c.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        # Existing accounts use the email prefix as a default username.
+        for row in c.execute("SELECT id,email FROM users WHERE username IS NULL").fetchall():
+            base_name = row["email"].split("@")[0]
+            candidate = base_name
+            n = 1
+            while c.execute("SELECT 1 FROM users WHERE username=?", (candidate,)).fetchone():
+                candidate = f"{base_name}{n}"; n += 1
+            c.execute("UPDATE users SET username=? WHERE id=?", (candidate, row["id"]))
+
+    c.execute("""CREATE TABLE IF NOT EXISTS password_resets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        token_hash TEXT NOT NULL, expires TEXT NOT NULL, used INTEGER DEFAULT 0
+    )""")
+
+    # Evidence records
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS evidence (
+            id TEXT PRIMARY KEY,
+            filename TEXT,
+            path TEXT,
+            sha256 TEXT,
+            created TEXT,
+            size INTEGER,
+            owner_id INTEGER
+        )
+    """)
+
+    # Add owner_id to an existing evidence table if needed
+    columns = [
+        row["name"] for row in
+        c.execute("PRAGMA table_info(evidence)").fetchall()
+    ]
+
+    if "owner_id" not in columns:
+        c.execute("ALTER TABLE evidence ADD COLUMN owner_id INTEGER")
+
+    # Chain of custody
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS custody (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            evidence_id TEXT,
+            event TEXT,
+            timestamp TEXT,
+            prev_hash TEXT,
+            record_hash TEXT,
+            signature TEXT,
+            details TEXT
+        )
+    """)
+
     c.commit()
     return c
+class User(UserMixin):
+    def __init__(self, user_id, email):
+        self.id = str(user_id)
+        self.email = email
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    c = db()
+
+    user = c.execute(
+        "SELECT id, email FROM users WHERE id = ?",
+        (user_id,)
+    ).fetchone()
+
+    c.close()
+
+    if user:
+        return User(user["id"], user["email"])
+
+    return None
 
 def file_hash(path):
     h = hashlib.sha256()
@@ -71,7 +169,7 @@ def add_custody(c, evidence_id, event, evidence_sha, details=None):
 
 def verify_custody():
     c = db()
-    rows = c.execute("SELECT * FROM custody ORDER BY seq").fetchall()
+    rows = c.execute("SELECT custody.* FROM custody JOIN evidence ON evidence.id=custody.evidence_id WHERE evidence.owner_id=? ORDER BY custody.seq", (int(current_user.get_id()),)).fetchall()
     pub = signing_key().public_key()
     previous = "GENESIS"
     results = []
@@ -195,7 +293,7 @@ def neo4j_write(nodes, edges):
 
 def build_graph():
     c = db()
-    rows = c.execute("SELECT id,filename,sha256,size FROM evidence ORDER BY created").fetchall()
+    rows = c.execute("SELECT id,filename,sha256,size FROM evidence WHERE owner_id=? ORDER BY created", (int(current_user.get_id()),)).fetchall()
     nodes = [{"id": "root", "label": "Evidence Repository", "group": "root",
               "title": "CyberTrace evidence repository"}]
     edges, seen = [], {"root"}
@@ -244,11 +342,123 @@ def build_graph():
                 edges.append({"from": eid, "to": mid, "label": "YARA match"})
     return nodes, edges
 
+
+AUTH_CSS = """<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 15% 20%,#173f78 0,transparent 32%),radial-gradient(circle at 85% 80%,#542b82 0,transparent 35%),linear-gradient(135deg,#071326,#101b35 55%,#080f20);font-family:Inter,Segoe UI,Arial;color:#edf5ff}
+.auth{width:min(440px,100%);padding:34px;border:1px solid #45628a88;border-radius:24px;background:#101d33eF;box-shadow:0 25px 80px #0008;backdrop-filter:blur(14px)}.logo{width:54px;height:54px;border-radius:16px;display:grid;place-items:center;background:linear-gradient(135deg,#16d6c2,#477bff);font-size:26px;box-shadow:0 8px 25px #167fbd66}.eyebrow{color:#63e5d5;font-size:12px;letter-spacing:2px;font-weight:700;margin-top:20px}h1{font-size:29px;margin:8px 0}.sub{color:#a9bdd8;line-height:1.5;margin:0 0 24px}.field{display:block;margin:15px 0 6px;color:#d8e7ff;font-size:13px}.auth input{width:100%;padding:14px 15px;border-radius:11px;border:1px solid #3b5276;background:#0a1427;color:white;outline:none}.auth input:focus{border-color:#43d8d0;box-shadow:0 0 0 3px #43d8d022}.primary{width:100%;padding:14px;margin-top:20px;border:0;border-radius:11px;color:#06152a;font-weight:800;background:linear-gradient(100deg,#42e2ce,#69a2ff);cursor:pointer}.links{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:19px}.auth a{color:#70d9f3;text-decoration:none;font-size:13px}.msg{padding:11px;border-radius:9px;background:#293c5b;color:#d9ebff;margin:10px 0;font-size:13px}.hint{font-size:12px;color:#90a8c8;margin-top:16px}
+</style>"""
+def auth_page(title, subtitle, fields, button, links="", note=""):
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CyberTrace | {title}</title>{AUTH_CSS}</head><body><section class="auth"><div class="logo">⌁</div><div class="eyebrow">CYBERTRACE · DIGITAL FORENSICS</div><h1>{title}</h1><p class="sub">{subtitle}</p>{{% with messages=get_flashed_messages() %}}{{% for m in messages %}}<div class="msg">{{{{m}}}}</div>{{% endfor %}}{{% endwith %}}<form method="post">{fields}<button class="primary" type="submit">{button}</button></form><div class="links">{links}</div><div class="hint">{note}</div></section></body></html>"""
+
+REGISTER_HTML = auth_page("Create your account", "Start your secure digital evidence workspace.", '<label class="field">Username</label><input name="username" minlength="3" maxlength="30" required placeholder="Choose a username"><label class="field">Email address</label><input type="email" name="email" required placeholder="you@example.com"><label class="field">Password</label><input type="password" name="password" minlength="12" required placeholder="At least 12 characters">', "Create account", '<a href="/login">Already registered? Sign in</a>', "Use a unique password of at least 12 characters.")
+LOGIN_HTML = auth_page("Welcome back", "Sign in to continue your investigation workspace.", '<label class="field">Username or email</label><input name="identity" required autocomplete="username" placeholder="Username or email"><label class="field">Password</label><input type="password" name="password" required autocomplete="current-password" placeholder="Your password">', "Sign in", '<a href="/forgot-username">Forgot username?</a><a href="/forgot-password">Forgot password?</a><a href="/register">Create account</a>', "Protected access · CyberTrace IMP-03")
+FORGOT_USER_HTML = auth_page("Recover username", "Enter the email address linked to your account. We’ll email your username if it exists.", '<label class="field">Registered email</label><input type="email" name="email" required placeholder="you@example.com">', "Send username", '<a href="/login">Back to login</a>')
+FORGOT_PASS_HTML = auth_page("Reset password", "Enter your registered email to receive a secure reset link.", '<label class="field">Registered email</label><input type="email" name="email" required placeholder="you@example.com">', "Send reset link", '<a href="/login">Back to login</a>')
+RESET_HTML = auth_page("Choose a new password", "Set a new password for your CyberTrace account.", '<label class="field">New password</label><input type="password" name="password" minlength="12" required placeholder="At least 12 characters"><label class="field">Confirm password</label><input type="password" name="confirm" minlength="12" required placeholder="Re-enter password">', "Update password", '<a href="/login">Back to login</a>')
+
+def send_mail(to, subject, body):
+    host=os.getenv("MAIL_SERVER", "smtp.gmail.com"); port=int(os.getenv("MAIL_PORT", "587"))
+    sender=os.getenv("MAIL_USERNAME"); password=os.getenv("MAIL_APP_PASSWORD")
+    if not sender or not password:
+        raise RuntimeError("Email is not configured. Set MAIL_USERNAME and MAIL_APP_PASSWORD.")
+    msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=sender; msg["To"]=to; msg.set_content(body)
+    with smtplib.SMTP(host, port, timeout=20) as server:
+        server.starttls(); server.login(sender, password); server.send_message(msg)
+
+def reset_serializer():
+    return URLSafeTimedSerializer(app.secret_key, salt="cybertrace-password-reset-v1")
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_user.is_authenticated: return redirect(url_for("home"))
+    if request.method == "POST":
+        username=request.form.get("username", "").strip().lower()
+        email=request.form.get("email", "").strip().lower(); password=request.form.get("password", "")
+        if not re.fullmatch(r"[a-z0-9_.-]{3,30}", username):
+            flash("Username must be 3–30 characters: letters, numbers, dot, underscore or hyphen."); return redirect(url_for("register"))
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            flash("Please enter a valid email address."); return redirect(url_for("register"))
+        if len(password)<12: flash("Password must be at least 12 characters."); return redirect(url_for("register"))
+        c=db()
+        try:
+            c.execute("INSERT INTO users (email,username,password_hash,created) VALUES (?,?,?,?)",(email,username,generate_password_hash(password),now())); c.commit()
+            flash("Account created. Please sign in."); return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            flash("That email or username is already registered."); return redirect(url_for("register"))
+        finally: c.close()
+    return render_template_string(REGISTER_HTML)
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated: return redirect(url_for("home"))
+    if request.method == "POST":
+        identity=request.form.get("identity", "").strip().lower(); password=request.form.get("password", "")
+        c=db(); user=c.execute("SELECT id,email,username,password_hash FROM users WHERE email=? OR username=?",(identity,identity)).fetchone(); c.close()
+        if user and check_password_hash(user["password_hash"], password):
+            login_user(User(user["id"], user["email"])); return redirect(url_for("home"))
+        flash("Invalid username/email or password.")
+    return render_template_string(LOGIN_HTML)
+
+@app.route("/forgot-username", methods=["GET", "POST"])
+def forgot_username():
+    if request.method == "POST":
+        email=request.form.get("email", "").strip().lower(); c=db(); user=c.execute("SELECT username FROM users WHERE email=?",(email,)).fetchone(); c.close()
+        if user:
+            try: send_mail(email,"Your CyberTrace username",f"Your CyberTrace username is: {user['username']}\n\nIf you did not request this, ignore this email.")
+            except Exception: app.logger.exception("Username recovery email failed")
+        flash("If an account exists for that email, username recovery instructions have been sent.")
+        return redirect(url_for("forgot_username"))
+    return render_template_string(FORGOT_USER_HTML)
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        email=request.form.get("email", "").strip().lower(); c=db(); user=c.execute("SELECT id FROM users WHERE email=?",(email,)).fetchone()
+        if user:
+            token=reset_serializer().dumps({"uid":user["id"],"nonce":secrets.token_urlsafe(16)})
+            c.execute("INSERT INTO password_resets (user_id,token_hash,expires,used) VALUES (?,?,?,0)",(user["id"],hashlib.sha256(token.encode()).hexdigest(),(datetime.now(timezone.utc)+timedelta(minutes=30)).isoformat())); c.commit()
+            reset_url=url_for("reset_password",token=token,_external=True)
+            try: send_mail(email,"Reset your CyberTrace password",f"Use this link within 30 minutes to reset your password:\n{reset_url}\n\nIf you did not request this, ignore this email.")
+            except Exception: app.logger.exception("Password reset email failed")
+        c.close(); flash("If an account exists for that email, a password reset link has been sent.")
+        return redirect(url_for("forgot_password"))
+    return render_template_string(FORGOT_PASS_HTML)
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    try: payload=reset_serializer().loads(token,max_age=1800)
+    except (BadSignature,SignatureExpired): return "This reset link is invalid or expired.",400
+    token_hash=hashlib.sha256(token.encode()).hexdigest(); c=db()
+    record=c.execute("SELECT id,user_id FROM password_resets WHERE token_hash=? AND used=0",(token_hash,)).fetchone()
+    if not record: c.close(); return "This reset link has already been used or is invalid.",400
+    if request.method == "POST":
+        password=request.form.get("password", ""); confirm=request.form.get("confirm", "")
+        if len(password)<12 or password!=confirm:
+            flash("Passwords must match and contain at least 12 characters."); c.close(); return render_template_string(RESET_HTML)
+        c.execute("UPDATE users SET password_hash=? WHERE id=?",(generate_password_hash(password),record["user_id"]))
+        c.execute("UPDATE password_resets SET used=1 WHERE user_id=?",(record["user_id"],)); c.commit(); c.close()
+        flash("Password updated. Please sign in."); return redirect(url_for("login"))
+    c.close(); return render_template_string(RESET_HTML)
+
+@app.post("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
 @app.get("/")
+@login_required
 def home():
-    return render_template("index.html")
+    return render_template("index.html", email=current_user.email)
+
+def owned_evidence(c, eid):
+    row = c.execute("SELECT * FROM evidence WHERE id=? AND owner_id=?", (eid, int(current_user.get_id()))).fetchone()
+    if row is None:
+        abort(404)
+    return row
 
 @app.post("/api/evidence")
+@login_required
 def upload_evidence():
     f = request.files.get("file")
     if not f or not f.filename: return jsonify(error="Select a file"), 400
@@ -260,23 +470,24 @@ def upload_evidence():
     f.save(target)
     sha = file_hash(target)
     c = db()
-    c.execute("INSERT INTO evidence VALUES(?,?,?,?,?,?)",
-              (eid, filename, str(target.relative_to(ROOT)), sha, now(), target.stat().st_size))
+    c.execute("INSERT INTO evidence (id,filename,path,sha256,created,size,owner_id) VALUES(?,?,?,?,?,?,?)",
+              (eid, filename, str(target.relative_to(ROOT)), sha, now(), target.stat().st_size, int(current_user.get_id())))
     c.commit()
     add_custody(c, eid, "EVIDENCE_REGISTERED", sha, {"filename": filename, "size": target.stat().st_size})
     return jsonify(id=eid, filename=filename, sha256=sha, size=target.stat().st_size)
 
 @app.get("/api/evidence")
+@login_required
 def list_evidence():
     c = db()
     return jsonify([dict(r) for r in c.execute(
-        "SELECT id,filename,sha256,created,size FROM evidence ORDER BY created DESC")])
+        "SELECT id,filename,sha256,created,size FROM evidence WHERE owner_id=? ORDER BY created DESC", (int(current_user.get_id()),))])
 
 @app.post("/api/analyze/<eid>")
+@login_required
 def analyze_evidence(eid):
     c = db()
-    row = c.execute("SELECT * FROM evidence WHERE id=?", (eid,)).fetchone()
-    if not row: abort(404)
+    row = owned_evidence(c, eid)
     path = ROOT / row["path"]
     ext = path.suffix.lower()
     report = {"evidence_id": eid, "filename": row["filename"], "sha256": file_hash(path),
@@ -333,25 +544,14 @@ def correlate_threat_intel(iocs):
         try:
             import requests
             headers = {"X-OTX-API-KEY": key}
-            queried = 0
-            for ip in iocs.get("ipv4", []):
-                try:
-                    # Do not send RFC1918, loopback, link-local, multicast, or reserved addresses to OTX.
-                    if not ipaddress.ip_address(ip).is_global:
-                        continue
-                except ValueError:
-                    continue
-                if queried >= 15:
-                    break
-                queried += 1
+            for ip in iocs.get("ipv4", [])[:30]:
                 r = requests.get(f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/general",
                                  headers=headers, timeout=12)
                 if r.ok:
                     j = r.json()
-                    pulse_count = j.get("pulse_info", {}).get("count", 0)
-                    if pulse_count:
+                    if j.get("pulse_info", {}).get("count", 0):
                         result["matches"].append({"type": "ipv4", "indicator": ip,
-                                                  "pulse_count": pulse_count, "source": "AlienVault OTX"})
+                                                  "pulse_count": j["pulse_info"]["count"], "source": "AlienVault OTX"})
             result["sources"].append("AlienVault OTX")
         except Exception as e:
             result["note"] = "OTX query error: " + str(e)
@@ -361,6 +561,7 @@ def correlate_threat_intel(iocs):
     return result
 
 @app.post("/api/threat-intel/taxii-sync")
+@login_required
 def taxii_sync():
     url, collection_id = os.getenv("TAXII_DISCOVERY_URL"), os.getenv("TAXII_COLLECTION_ID")
     if not (url and collection_id):
@@ -380,6 +581,7 @@ def taxii_sync():
         return jsonify(error="TAXII sync failed: " + str(e)), 500
 
 @app.get("/api/graph")
+@login_required
 def graph_api():
     nodes, edges = build_graph()
     neo = neo4j_write(nodes, edges)
@@ -388,19 +590,21 @@ def graph_api():
                    notice="Threat/ATT&CK relationships are evidence-derived. ATT&CK mappings are heuristic and require analyst validation.")
 
 @app.get("/api/custody/verify")
+@login_required
 def custody_api():
     return jsonify(verify_custody())
 
 @app.get("/api/custody")
+@login_required
 def custody_records():
     c = db()
-    return jsonify([dict(r) for r in c.execute("SELECT * FROM custody ORDER BY seq")])
+    return jsonify([dict(r) for r in c.execute("SELECT custody.* FROM custody JOIN evidence ON evidence.id=custody.evidence_id WHERE evidence.owner_id=? ORDER BY custody.seq", (int(current_user.get_id()),))])
 
 @app.post("/api/package/<eid>")
+@login_required
 def package_evidence(eid):
     c = db()
-    row = c.execute("SELECT * FROM evidence WHERE id=?", (eid,)).fetchone()
-    if not row: abort(404)
+    row = owned_evidence(c, eid)
     evidence_path = ROOT / row["path"]
     report_path = REPORTS / f"{eid}.json"
     manifest = {"package_id": str(uuid.uuid4()), "created": now(), "evidence_id": eid,
@@ -423,16 +627,17 @@ def package_evidence(eid):
     return send_file(dest, as_attachment=True, download_name=dest.name)
 
 @app.get("/api/report/<eid>")
+@login_required
 def download_report(eid):
     p = REPORTS / f"{eid}.json"
     if not p.exists(): abort(404)
     return send_file(p, as_attachment=True, download_name=f"CyberTrace_Report_{eid}.json")
 
 @app.get("/api/stix/<eid>")
+@login_required
 def stix_export(eid):
     c = db()
-    row = c.execute("SELECT * FROM evidence WHERE id=?", (eid,)).fetchone()
-    if not row: abort(404)
+    row = owned_evidence(c, eid)
     try:
         from stix2 import Bundle, Identity, Note, Indicator
         ident = Identity(name="CyberTrace", identity_class="system")
