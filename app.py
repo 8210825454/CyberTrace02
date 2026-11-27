@@ -41,25 +41,54 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+class PostgresConnection:
+    """Small psycopg2 adapter for the sqlite-style execute API used by this app."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, params=()):
+        from psycopg2.extras import RealDictCursor
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(sql.replace("?", "%s"), params)
+        return cursor
+
+    def commit(self):
+        self.connection.commit()
+
+    def close(self):
+        self.connection.close()
+
+
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
+    database_url = os.getenv("DATABASE_URL")
+    is_postgres = bool(database_url)
+    if is_postgres:
+        import psycopg2
+        # Render may supply postgres://; psycopg2 accepts it, and SSL is required for hosted DBs.
+        raw = psycopg2.connect(database_url, sslmode="require", connect_timeout=10)
+        c = PostgresConnection(raw)
+        id_type = "SERIAL PRIMARY KEY"
+    else:
+        raw = sqlite3.connect(DB)
+        raw.row_factory = sqlite3.Row
+        c = raw
+        id_type = "INTEGER PRIMARY KEY AUTOINCREMENT"
 
     # User accounts
-    c.execute("""
+    c.execute(f"""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            username TEXT UNIQUE,
-            password_hash TEXT NOT NULL,
-            created TEXT NOT NULL
+            id {id_type}, email TEXT UNIQUE NOT NULL, username TEXT UNIQUE,
+            password_hash TEXT NOT NULL, created TEXT NOT NULL
         )
     """)
 
-    user_columns = [row["name"] for row in c.execute("PRAGMA table_info(users)").fetchall()]
+    if is_postgres:
+        user_columns = [r["column_name"] for r in c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='users'").fetchall()]
+    else:
+        user_columns = [r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()]
     if "username" not in user_columns:
         c.execute("ALTER TABLE users ADD COLUMN username TEXT")
-        # Existing accounts use the email prefix as a default username.
         for row in c.execute("SELECT id,email FROM users WHERE username IS NULL").fetchall():
             base_name = row["email"].split("@")[0]
             candidate = base_name
@@ -68,47 +97,27 @@ def db():
                 candidate = f"{base_name}{n}"; n += 1
             c.execute("UPDATE users SET username=? WHERE id=?", (candidate, row["id"]))
 
-    c.execute("""CREATE TABLE IF NOT EXISTS password_resets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
-        token_hash TEXT NOT NULL, expires TEXT NOT NULL, used INTEGER DEFAULT 0
+    c.execute(f"""CREATE TABLE IF NOT EXISTS password_resets (
+        id {id_type}, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL,
+        expires TEXT NOT NULL, used INTEGER DEFAULT 0
     )""")
 
-    # Evidence records
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS evidence (
-            id TEXT PRIMARY KEY,
-            filename TEXT,
-            path TEXT,
-            sha256 TEXT,
-            created TEXT,
-            size INTEGER,
-            owner_id INTEGER
-        )
-    """)
-
-    # Add owner_id to an existing evidence table if needed
-    columns = [
-        row["name"] for row in
-        c.execute("PRAGMA table_info(evidence)").fetchall()
-    ]
-
-    if "owner_id" not in columns:
+    c.execute("""CREATE TABLE IF NOT EXISTS evidence (
+        id TEXT PRIMARY KEY, filename TEXT, path TEXT, sha256 TEXT,
+        created TEXT, size BIGINT, owner_id INTEGER
+    )""")
+    if is_postgres:
+        evidence_columns = [r["column_name"] for r in c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='evidence'").fetchall()]
+    else:
+        evidence_columns = [r["name"] for r in c.execute("PRAGMA table_info(evidence)").fetchall()]
+    if "owner_id" not in evidence_columns:
         c.execute("ALTER TABLE evidence ADD COLUMN owner_id INTEGER")
 
-    # Chain of custody
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS custody (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT,
-            evidence_id TEXT,
-            event TEXT,
-            timestamp TEXT,
-            prev_hash TEXT,
-            record_hash TEXT,
-            signature TEXT,
-            details TEXT
-        )
-    """)
-
+    c.execute(f"""CREATE TABLE IF NOT EXISTS custody (
+        seq {id_type}, evidence_id TEXT, event TEXT, timestamp TEXT,
+        prev_hash TEXT, record_hash TEXT, signature TEXT, details TEXT
+    )""")
     c.commit()
     return c
 class User(UserMixin):
@@ -383,7 +392,16 @@ def register():
         try:
             c.execute("INSERT INTO users (email,username,password_hash,created) VALUES (?,?,?,?)",(email,username,generate_password_hash(password),now())); c.commit()
             flash("Account created. Please sign in."); return redirect(url_for("login"))
-        except sqlite3.IntegrityError:
+        except Exception as exc:
+            is_duplicate = isinstance(exc, sqlite3.IntegrityError)
+            if os.getenv("DATABASE_URL"):
+                try:
+                    import psycopg2
+                    is_duplicate = is_duplicate or isinstance(exc, psycopg2.IntegrityError)
+                except ImportError:
+                    pass
+            if not is_duplicate:
+                raise
             flash("That email or username is already registered."); return redirect(url_for("register"))
         finally: c.close()
     return render_template_string(REGISTER_HTML)
@@ -629,9 +647,21 @@ def package_evidence(eid):
 @app.get("/api/report/<eid>")
 @login_required
 def download_report(eid):
-    p = REPORTS / f"{eid}.json"
-    if not p.exists(): abort(404)
-    return send_file(p, as_attachment=True, download_name=f"CyberTrace_Report_{eid}.json")
+    # Verify that the requested evidence belongs to the logged-in user
+    # before allowing access to its associated report.
+    c = db()
+    try:
+        owned_evidence(c, eid)
+        p = REPORTS / f"{eid}.json"
+        if not p.is_file():
+            abort(404)
+        return send_file(
+            p,
+            as_attachment=True,
+            download_name=f"CyberTrace_Report_{eid}.json"
+        )
+    finally:
+        c.close()
 
 @app.get("/api/stix/<eid>")
 @login_required
